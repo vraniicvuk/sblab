@@ -8,7 +8,9 @@ from http.cookies import SimpleCookie
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 PUBLIC = ROOT / 'outputs'
 KEYFILE = ROOT / 'work' / '.odds-api.env'
-DBFILE = ROOT / 'work' / 'users.sqlite3'
+CLOUD = os.environ.get('SBLAB_CLOUD') == '1'
+DBFILE = pathlib.Path(os.environ.get('SBLAB_DB_PATH', str(ROOT / 'work' / 'users.sqlite3')))
+PUBLIC_HOST = os.environ.get('RENDER_EXTERNAL_HOSTNAME', '')
 
 def db():
     fd=os.open(str(DBFILE), os.O_CREAT | os.O_WRONLY, 0o600)
@@ -37,6 +39,8 @@ def load_key():
 
 # One local feed request shared by all logged-in browsers. Failures are never
 # returned as successful cached quotes. This cache does not imply bookmaker freshness.
+_login_lock = threading.Lock()
+_login_attempts = []
 _feed_lock = threading.Lock()
 _feed_state = {'checked_monotonic': 0.0, 'result': None, 'status': 503}
 FEED_INTERVAL = 10.0
@@ -54,6 +58,25 @@ def cached_betburger(fetch, clock=time.monotonic):
         _feed_state.update(checked_monotonic=clock(), status=status, result=result)
         return status,result
 
+def valid_origin(host, origin, post=False):
+    if CLOUD:
+        return bool(PUBLIC_HOST) and host == PUBLIC_HOST and (origin == 'https://' + PUBLIC_HOST if post else not origin or origin == 'https://' + PUBLIC_HOST)
+    return host in ('localhost:8765','127.0.0.1:8765') and (origin == 'http://' + host if post else not origin or origin in ('http://localhost:8765','http://127.0.0.1:8765'))
+
+def bootstrap_cloud():
+    if not CLOUD: return
+    if not PUBLIC_HOST or not os.environ.get('SBLAB_DB_PATH') or not DBFILE.parent.is_dir():
+        raise RuntimeError('Cloud requires configured host and an existing persistent data directory')
+    with db() as conn:
+        if conn.execute('SELECT 1 FROM users LIMIT 1').fetchone(): return
+        username=os.environ.get('SBLAB_ADMIN_USER','vuk')
+        password=os.environ.get('SBLAB_ADMIN_PASSWORD','')
+        if not valid_user(username,password) or len(password)<16:
+            raise RuntimeError('Initial admin requires an environment password of at least 16 characters')
+        salt=secrets.token_hex(16)
+        conn.execute('INSERT INTO users VALUES (?,?,?,?)',(username,salt,hash_password(password,salt),'admin'))
+        conn.commit()
+
 class Handler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(PUBLIC), **kwargs)
@@ -64,7 +87,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         # Reject remote browser origins and DNS-rebinding Host headers.
         host = self.headers.get('Host', '')
         origin = self.headers.get('Origin')
-        if host not in ('localhost:8765', '127.0.0.1:8765') or (origin and origin not in ('http://localhost:8765', 'http://127.0.0.1:8765')):
+        if not valid_origin(host, origin):
             self.send_error(403); return
         if parsed.path == '/api/session':
             with db() as conn:
@@ -132,7 +155,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def do_POST(self):
         host=self.headers.get('Host',''); origin=self.headers.get('Origin','')
-        if host not in ('localhost:8765','127.0.0.1:8765') or origin != 'http://'+host:
+        if not valid_origin(host, origin, post=True):
             return self.json_reply(403, {'error':'Zahtev nije iz ove aplikacije.'})
         try:
             length=int(self.headers.get('Content-Length','0'))
@@ -141,7 +164,14 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             if not isinstance(data,dict): raise ValueError()
         except (ValueError,TypeError): return self.json_reply(400, {'error':'Neispravan zahtev.'})
         path=urllib.parse.urlsplit(self.path).path
+        if path == '/api/setup' and CLOUD: return self.json_reply(403, {'error':'Online registracija je onemogućena.'})
         if path in ('/api/setup','/api/login'):
+            if CLOUD and path == '/api/login':
+                with _login_lock:
+                    now=time.monotonic()
+                    _login_attempts[:]=[t for t in _login_attempts if now-t < 60]
+                    if len(_login_attempts) >= 12: return self.json_reply(429, {'error':'Previše pokušaja prijave. Pokušaj kasnije.'})
+                    _login_attempts.append(now)
             username=data.get('username');password=data.get('password')
             if not valid_user(username,password): return self.json_reply(400, {'error':'Korisničko ime: 3–32 slova, cifre ili ._-; lozinka najmanje 10 znakova.'})
             with db() as conn:
@@ -160,7 +190,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 conn.execute('DELETE FROM sessions WHERE expires<?',(time.time(),))
                 conn.execute('INSERT INTO sessions VALUES (?,?,?)',(hashlib.sha256(token.encode()).hexdigest(),username,time.time()+28800))
                 conn.commit()
-            return self.json_reply(200, {'user':{'username':username,'role':role}},cookie='sb_session='+token+'; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800')
+            return self.json_reply(200, {'user':{'username':username,'role':role}},cookie='sb_session='+token+'; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800'+('; Secure' if CLOUD else ''))
         user=self.current_user()
         if not user: return self.json_reply(401, {'error':'Prijavite se.'})
         if path == '/api/logout':
@@ -222,6 +252,17 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.send_header('Content-Length',str(len(data)))
         self.end_headers(); self.wfile.write(data)
 
+def poll_background():
+    while True:
+        try: cached_betburger(lambda: Handler.fetch_betburger(None))
+        except Exception: pass
+        time.sleep(FEED_INTERVAL)
+
 if __name__ == '__main__':
-    print('Surebet Lab: http://localhost:8765/surebet-lab.html', flush=True)
-    http.server.ThreadingHTTPServer(('127.0.0.1', 8765), Handler).serve_forever()
+    bootstrap_cloud()
+    if CLOUD:
+        threading.Thread(target=poll_background, daemon=True).start()
+    host='0.0.0.0' if CLOUD else '127.0.0.1'
+    port=int(os.environ.get('PORT','8765')) if CLOUD else 8765
+    print('Surebet Lab listening on port',port,flush=True)
+    http.server.ThreadingHTTPServer((host,port), Handler).serve_forever()

@@ -19,7 +19,7 @@ def get(c,path,user):
         row=c.execute('SELECT value FROM settings WHERE key=?',('bookmakers',)).fetchone()
         return 200,{'bookmakers':json.loads(row[0]) if row else []}
     if path=='/api/tasks':
-        rows=c.execute('SELECT id,snapshot,owner,status,legs,note,realized,updated FROM tasks ORDER BY updated DESC LIMIT 250').fetchall()
+        rows=(c.execute('SELECT id,snapshot,owner,status,legs,note,realized,updated FROM tasks ORDER BY updated DESC LIMIT 250').fetchall() if user['role']=='admin' else c.execute('SELECT id,snapshot,owner,status,legs,note,realized,updated FROM tasks WHERE owner = ? COLLATE NOCASE ORDER BY updated DESC LIMIT 250',(user['username'],)).fetchall())
         return 200,{'tasks':[{'id':r[0],'snapshot':json.loads(r[1]),'owner':r[2],'status':r[3],'legs':json.loads(r[4]),'note':r[5],'realized':r[6],'updated':r[7]} for r in rows]}
     if path=='/api/bonuses':
         if user['role']!='admin':return 403,{'error':'Samo administrator.'}

@@ -2,6 +2,7 @@
 import http.server, json, os, pathlib, re, urllib.parse, urllib.request, urllib.error
 from betburger_adapter import normalize_response
 import features
+import own_scanner
 import sqlite3, hashlib, hmac, secrets, time, threading
 from datetime import datetime, timezone
 from http.cookies import SimpleCookie
@@ -208,6 +209,18 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             token=cookies['sb_session'].value
             with db() as conn: conn.execute('DELETE FROM sessions WHERE token_hash=?',(hashlib.sha256(token.encode()).hexdigest(),)); conn.commit()
             return self.json_reply(200, {'ok':True},cookie='sb_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0')
+        if path == '/api/own-scan':
+            if user['role'] != 'admin': return self.json_reply(403, {'error':'Samo admin može pokrenuti test.'})
+            key=load_key()
+            if not key:return self.json_reply(503, {'error':'The Odds API ključ nije podešen na serveru.'})
+            params={'apiKey':key,'regions':'eu','markets':'h2h','oddsFormat':'decimal','includeLinks':'true'}
+            url='https://api.the-odds-api.com/v4/sports/upcoming/odds/?'+urllib.parse.urlencode(params)
+            try:
+                with urllib.request.urlopen(url,timeout=20) as response:
+                    payload=json.loads(response.read());remaining=response.headers.get('x-requests-remaining');cost=response.headers.get('x-requests-last')
+                return self.json_reply(200, {'source':'The Odds API','scope':'upcoming · EU · h2h','events':len(payload),'candidates':own_scanner.scan(payload),'credits_remaining':remaining,'credits_used':cost})
+            except urllib.error.HTTPError as e:return self.json_reply(e.code, {'error':'Izvor je odbio zahtev (HTTP %s).' % e.code})
+            except (OSError,ValueError,TypeError):return self.json_reply(502, {'error':'Izvor nije dostupan ili je odgovor neispravan.'})
         if path in ('/api/bookmakers','/api/tasks','/api/bonuses'):
             with db() as conn:
                 status, result = features.post(conn,path,user,data)

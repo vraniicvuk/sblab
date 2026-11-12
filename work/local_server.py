@@ -46,6 +46,63 @@ _feed_lock = threading.Lock()
 _feed_state = {'checked_monotonic': 0.0, 'result': None, 'status': 503}
 FEED_INTERVAL = 10.0
 
+# Conservative budget: at most six EU/H2H requests per day, retain 100 credits.
+# Persisted budget prevents restart from silently resetting the guard.
+_own_lock = threading.Lock()
+OWN_INTERVAL = 4 * 60 * 60
+OWN_RESERVE = 100
+
+def own_once(force=False):
+    with _own_lock:
+        with db() as c:
+            c.execute('CREATE TABLE IF NOT EXISTS feed_control (name TEXT PRIMARY KEY, payload TEXT NOT NULL)')
+            row=c.execute('SELECT payload FROM feed_control WHERE name=?',('own',)).fetchone()
+            state=json.loads(row[0]) if row else {}
+            now=time.time();today=datetime.now(timezone.utc).date().isoformat()
+            if state.get('day')!=today:state.update(day=today, daily=0)
+            if state.get('last_attempt') and state.get('remaining') is None:
+                return dict(state, paused='Nepoznata preostala kvota; automatski zahtevi su zaustavljeni.')
+            if state.get('remaining') is not None and state['remaining']<=OWN_RESERVE:
+                return dict(state, paused='Rezerva API kredita; automatsko skeniranje je zaustavljeno.')
+            if state.get('daily',0)>=6:
+                return dict(state, paused='Dnevni limit od šest zahteva je dostignut.')
+            if now-state.get('last_attempt',0)<OWN_INTERVAL:
+                return state
+            key=load_key()
+            if not key:return dict(state, paused='Nedostaje API ključ.')
+            # Reserve request before network call, including failed calls, so restarts cannot loop.
+            state.update(last_attempt=now,day=today,daily=state.get('daily',0)+1, error=None)
+            c.execute('INSERT OR REPLACE INTO feed_control VALUES (?,?)',('own',json.dumps(state)));c.commit()
+        params={'apiKey':key,'regions':'eu','markets':'h2h','oddsFormat':'decimal','includeLinks':'true'}
+        url='https://api.the-odds-api.com/v4/sports/upcoming/odds/?'+urllib.parse.urlencode(params)
+        try:
+            with urllib.request.urlopen(url,timeout=20) as response:
+                payload=json.loads(response.read()); remaining=response.headers.get('x-requests-remaining');cost=response.headers.get('x-requests-last')
+            if not isinstance(payload,list):raise ValueError('Invalid payload')
+            remaining=int(remaining) if remaining is not None else None
+            cost=int(cost) if cost is not None else None
+            state.update(events=len(payload),candidates=own_scanner.scan(payload),remaining=remaining,cost=cost,received_at=time.time())
+        except urllib.error.HTTPError as e:state.update(error='Izvor odbio zahtev (HTTP %s)' % e.code,candidates=[])
+        except (OSError,ValueError,TypeError,OverflowError):state.update(error='Izvor nije dostupan ili je odgovor neispravan.',candidates=[])
+        with db() as c:
+            c.execute('INSERT OR REPLACE INTO feed_control VALUES (?,?)',('own',json.dumps(state,ensure_ascii=False)));c.commit()
+        return state
+
+def own_status():
+    with db() as c:
+        c.execute('CREATE TABLE IF NOT EXISTS feed_control (name TEXT PRIMARY KEY, payload TEXT NOT NULL)')
+        row=c.execute('SELECT payload FROM feed_control WHERE name=?',('own',)).fetchone()
+    state=json.loads(row[0]) if row else {}
+    if time.time()-state.get('received_at',0)>120: state['candidates']=[]
+    else:
+        def fresh(candidate):
+            try:
+                stamps=[datetime.fromisoformat(str(leg['updated_at']).replace('Z','+00:00')).timestamp() for leg in candidate['legs']]
+                return bool(stamps) and all(0<=time.time()-stamp<=120 for stamp in stamps)
+            except (KeyError,TypeError,ValueError,OverflowError):return False
+        state['candidates']=[x for x in state.get('candidates',[]) if fresh(x)]
+    return state
+
 def cached_betburger(fetch, clock=time.monotonic):
     with _feed_lock:
         now=clock()
@@ -93,7 +150,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.send_header('Cache-Control', 'no-store')
             self.end_headers()
             return
-        if parsed.path not in ('/api/odds-proxy', '/api/betburger-live', '/api/session', '/api/users', '/api/bookmakers', '/api/tasks', '/api/bonuses'):
+        if parsed.path not in ('/api/odds-proxy', '/api/betburger-live', '/api/session', '/api/users', '/api/bookmakers', '/api/tasks', '/api/bonuses', '/api/own-status'):
             return super().do_GET()
         # Reject remote browser origins and DNS-rebinding Host headers.
         host = self.headers.get('Host', '')
@@ -108,6 +165,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         user = self.current_user()
         if not user:
             return self.json_reply(401, {'error':'Prijavite se.'})
+        if parsed.path == '/api/own-status': return self.json_reply(200, own_status())
         if parsed.path in ('/api/bookmakers','/api/tasks','/api/bonuses'):
             with db() as conn:
                 status, result = features.get(conn,parsed.path,user)
@@ -211,16 +269,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return self.json_reply(200, {'ok':True},cookie='sb_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0')
         if path == '/api/own-scan':
             if user['role'] != 'admin': return self.json_reply(403, {'error':'Samo admin može pokrenuti test.'})
-            key=load_key()
-            if not key:return self.json_reply(503, {'error':'The Odds API ključ nije podešen na serveru.'})
-            params={'apiKey':key,'regions':'eu','markets':'h2h','oddsFormat':'decimal','includeLinks':'true'}
-            url='https://api.the-odds-api.com/v4/sports/upcoming/odds/?'+urllib.parse.urlencode(params)
-            try:
-                with urllib.request.urlopen(url,timeout=20) as response:
-                    payload=json.loads(response.read());remaining=response.headers.get('x-requests-remaining');cost=response.headers.get('x-requests-last')
-                return self.json_reply(200, {'source':'The Odds API','scope':'upcoming · EU · h2h','events':len(payload),'candidates':own_scanner.scan(payload),'credits_remaining':remaining,'credits_used':cost})
-            except urllib.error.HTTPError as e:return self.json_reply(e.code, {'error':'Izvor je odbio zahtev (HTTP %s).' % e.code})
-            except (OSError,ValueError,TypeError):return self.json_reply(502, {'error':'Izvor nije dostupan ili je odgovor neispravan.'})
+            result=own_once()
+            if result.get('error') or result.get('paused'): return self.json_reply(503, {'error':result.get('error') or result.get('paused')})
+            return self.json_reply(200, {'source':'The Odds API','scope':'upcoming · EU · h2h','events':result.get('events',0),'candidates':own_status().get('candidates',[]),'credits_remaining':result.get('remaining'),'credits_used':result.get('cost')})
         if path in ('/api/bookmakers','/api/tasks','/api/bonuses'):
             with db() as conn:
                 status, result = features.post(conn,path,user,data)
@@ -275,6 +326,12 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.send_header('Content-Length',str(len(data)))
         self.end_headers(); self.wfile.write(data)
 
+def poll_own_background():
+    while True:
+        try: own_once()
+        except Exception: pass
+        time.sleep(60)
+
 def poll_background():
     while True:
         try: cached_betburger(lambda: Handler.fetch_betburger(None))
@@ -285,6 +342,7 @@ if __name__ == '__main__':
     bootstrap_cloud()
     if CLOUD:
         threading.Thread(target=poll_background, daemon=True).start()
+        threading.Thread(target=poll_own_background, daemon=True).start()
     host='0.0.0.0' if CLOUD else '127.0.0.1'
     port=int(os.environ.get('PORT','8765')) if CLOUD else 8765
     print('Surebet Lab listening on port',port,flush=True)

@@ -80,8 +80,18 @@ def bootstrap_cloud():
 class Handler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(PUBLIC), **kwargs)
+    def list_directory(self, path):
+        self.send_error(404, 'Not found')
+        return None
+
     def do_GET(self):
         parsed = urllib.parse.urlsplit(self.path)
+        if parsed.path == '/':
+            self.send_response(302)
+            self.send_header('Location', '/surebet-lab.html')
+            self.send_header('Cache-Control', 'no-store')
+            self.end_headers()
+            return
         if parsed.path not in ('/api/odds-proxy', '/api/betburger-live', '/api/session', '/api/users', '/api/bookmakers', '/api/tasks', '/api/bonuses'):
             return super().do_GET()
         # Reject remote browser origins and DNS-rebinding Host headers.
